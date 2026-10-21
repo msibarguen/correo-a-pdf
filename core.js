@@ -28,7 +28,7 @@
 
   const Fuentes = (typeof CorreoFuentes !== 'undefined') ? CorreoFuentes : require('./fuentes.js');
 
-  const VERSION = '0.2.0';
+  const VERSION = '0.2.1';
   const LIMITE_BYTES = 100 * 1024 * 1024; // 100 MB por correo
   const PAGINA = [612, 936]; // oficio colombiano: 21,6 x 33 cm
   const MARGEN = 50;

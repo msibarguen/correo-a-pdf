@@ -1,4 +1,4 @@
-/* Correo a PDF — panel del complemento de Outlook (prototipo v0.2.0) */
+/* Correo a PDF — panel del complemento de Outlook (prototipo v0.2.1) */
 (function () {
   'use strict';
 
@@ -124,11 +124,32 @@
 
   // ------------------------------------------------------------------ generación
 
+  let ultimaEtapa = '';
   async function generar() {
     const item = Office.context.mailbox.item;
     if (!item) return;
     limpiarResultado();
     $('generar').disabled = true;
+    ultimoDiagnostico = { version: CorreoPDF.VERSION, fecha: new Date().toISOString(), etapas: [] };
+    let vigilante;
+    const tiempoMaximo = new Promise((ok, mal) => {
+      vigilante = setTimeout(() => mal(new Error('El proceso tardó más de 2 minutos en la etapa: "' + ultimaEtapa + '".')), 120000);
+    });
+    try {
+      await Promise.race([procesar(item), tiempoMaximo]);
+    } catch (e) {
+      console.error(e);
+      ultimoDiagnostico.error = String(e && e.message || e);
+      ultimoDiagnostico.etapaFallida = ultimaEtapa;
+      mostrarError('No se pudo generar el PDF: ' + (e.message || e));
+    } finally {
+      clearTimeout(vigilante);
+      $('progreso').classList.add('oculto');
+      $('generar').disabled = false;
+    }
+  }
+
+  async function procesar(item) {
     const urlsTemporales = [];
     try {
       const correo = await obtenerCorreo(item);
@@ -158,7 +179,7 @@
       }
 
       progreso('Maquetando el correo…');
-      const comunes = { anchoPx: CorreoPDF.ANCHO_PX, cargarFuente };
+      const comunes = { anchoPx: CorreoPDF.ANCHO_PX, cargarFuente, alProgresar: progreso };
       const segEncabezado = await CorreoRender.renderizar(CorreoPDF.htmlEncabezado(meta, 'America/Bogota'), Object.assign({ candidatos: [] }, comunes));
       const segCuerpo = await CorreoRender.renderizar(correo.html || correo.texto, Object.assign({ candidatos, esTexto: !correo.html }, comunes));
 
@@ -183,7 +204,7 @@
       }, { nombreDespacho: nombreBuzon(), alProgresar: progreso });
 
       ultimoDiagnostico = {
-        version: CorreoPDF.VERSION, fecha: new Date().toISOString(),
+        version: CorreoPDF.VERSION, fecha: new Date().toISOString(), etapas: ultimoDiagnostico.etapas,
         cliente: Office.context.diagnostics ? { host: Office.context.diagnostics.hostName, version: Office.context.diagnostics.hostVersion, plataforma: Office.context.diagnostics.platform } : null,
         origen: correo.diag.origen, errores: correo.diag.errores,
         htmlCaracteres: correo.html ? correo.html.length : 0,
@@ -192,20 +213,15 @@
         paginasCorreo: resultado.paginasCorreo, totalPaginas: resultado.totalPaginas
       };
       mostrarResultado(resultado);
-    } catch (e) {
-      console.error(e);
-      mostrarError('No se pudo generar el PDF: ' + (e.message || e));
     } finally {
       urlsTemporales.forEach(u => URL.revokeObjectURL(u));
-      $('progreso').classList.add('oculto');
-      $('generar').disabled = false;
     }
   }
 
   async function cargarFuente(cara) {
     if (!cacheFuentes.has(cara)) {
       cacheFuentes.set(cara, fetch(`fuentes/${cara}.ttf`).then(r => {
-        if (!r.ok) throw new Error('No se pudo cargar la fuente ' + cara);
+        if (!r.ok) throw new Error(`No se pudo descargar la fuente "${cara}" (respuesta ${r.status}). Verifique que la carpeta fuentes/ esté publicada junto al complemento.`);
         return r.arrayBuffer();
       }).then(b => new Uint8Array(b)));
     }
@@ -302,7 +318,11 @@
 
   // ------------------------------------------------------------------ interfaz
 
-  function progreso(msg) { const p = $('progreso'); p.textContent = msg; p.classList.remove('oculto'); }
+  function progreso(msg) {
+    const p = $('progreso'); p.textContent = msg; p.classList.remove('oculto');
+    ultimaEtapa = msg;
+    if (ultimoDiagnostico && ultimoDiagnostico.etapas) ultimoDiagnostico.etapas.push(Math.round(performance.now()) + ' ms · ' + msg);
+  }
 
   function limpiarResultado() {
     if (urlPdf) { URL.revokeObjectURL(urlPdf); urlPdf = null; }
@@ -310,5 +330,15 @@
     $('error').classList.add('oculto');
   }
 
-  function mostrarError(msg) { const e = $('error'); e.textContent = msg; e.classList.remove('oculto'); }
+  function mostrarError(msg) {
+    const e = $('error');
+    e.textContent = msg;
+    const b = document.createElement('button');
+    b.className = 'enlace-sutil';
+    b.textContent = 'Descargar diagnóstico técnico (sin contenido del correo)';
+    b.addEventListener('click', descargarDiagnostico);
+    e.appendChild(document.createElement('br'));
+    e.appendChild(b);
+    e.classList.remove('oculto');
+  }
 })();

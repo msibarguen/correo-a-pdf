@@ -35,7 +35,14 @@
   };
 
   const esperar = ms => new Promise(r => setTimeout(r, ms));
-  const cuadro = w => new Promise(r => (w.requestAnimationFrame || setTimeout)(() => r(), 16));
+  // Espera con tiempo máximo: nunca deja el proceso colgado
+  function conLimite(promesa, ms, alVencer) {
+    let t;
+    return Promise.race([
+      promesa.finally(() => clearTimeout(t)),
+      new Promise((ok, mal) => { t = setTimeout(() => (alVencer instanceof Error ? mal(alVencer) : ok(alVencer)), ms); })
+    ]);
+  }
 
   function color(txt) {
     const m = /rgba?\(([^)]+)\)/.exec(txt || '');
@@ -175,11 +182,21 @@
     const marco = document.createElement('iframe');
     marco.setAttribute('sandbox', 'allow-same-origin');
     marco.setAttribute('aria-hidden', 'true');
-    marco.style.cssText = `position:absolute;left:-30000px;top:0;width:${anchoPx}px;height:1px;border:0;`;
+    marco.setAttribute('tabindex', '-1');
+    // Dentro de la vista (1 px de alto, transparente) para que el navegador no congele el marco
+    marco.style.cssText = `position:fixed;left:0;top:0;width:${anchoPx}px;height:1px;border:0;opacity:0;pointer-events:none;z-index:-1;`;
     const listo = new Promise(r => marco.addEventListener('load', r, { once: true }));
     marco.srcdoc = contenidoHtml;
     document.body.appendChild(marco);
-    await listo;
+    // Respaldo: si el evento 'load' no llega, revisar el estado del documento
+    const sondeo = new Promise(r => {
+      const iv = setInterval(() => {
+        const d = marco.contentDocument;
+        if (d && d.readyState === 'complete' && d.body && d.body.childNodes.length) { clearInterval(iv); r(); }
+      }, 100);
+      setTimeout(() => clearInterval(iv), 15000);
+    });
+    await conLimite(Promise.race([listo, sondeo]), 15000, new Error('El marco de maquetación no cargó (etapa: crear marco).'));
     return marco;
   }
 
@@ -249,31 +266,26 @@ img{max-width:100%!important}
     return usadas;
   }
 
-  async function cargarFuentes(doc, familias, cargarFuente) {
+  // Carga las fuentes directamente desde memoria (API FontFace): no depende de la red ni del pintado
+  async function cargarFuentes(doc, win, familias, cargarFuente, avisar) {
     const bytes = {};
-    const reglas = [];
-    const urls = [];
+    const problemas = [];
     for (const fam of familias) {
-      for (const [est, peso, estilo] of [['r', 400, 'normal'], ['b', 700, 'normal'], ['i', 400, 'italic'], ['bi', 700, 'italic']]) {
+      for (const [est, peso, estilo] of [['r', '400', 'normal'], ['b', '700', 'normal'], ['i', '400', 'italic'], ['bi', '700', 'italic']]) {
         const cara = `${fam}-${est}`;
-        const b = await cargarFuente(cara);
+        avisar(`Maquetando el correo: fuente ${cara}…`);
+        const b = await conLimite(Promise.resolve(cargarFuente(cara)), 20000, new Error('No se pudo descargar la fuente ' + cara + ' (¿se subió la carpeta fuentes/?).'));
         bytes[cara] = b;
-        const url = URL.createObjectURL(new Blob([b], { type: 'font/ttf' }));
-        urls.push(url);
-        reglas.push(`@font-face{font-family:"cpdf-${fam}";src:url(${url}) format("truetype");font-weight:${peso};font-style:${estilo};font-display:block}`);
+        const copia = b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength);
+        const Cara = win.FontFace || FontFace;
+        const ff = new Cara(`cpdf-${fam}`, copia, { weight: peso, style: estilo });
+        try {
+          await conLimite(ff.load(), 8000, new Error('tiempo agotado'));
+          doc.fonts.add(ff);
+        } catch (e) { problemas.push(cara + ': ' + (e.message || e)); }
       }
     }
-    const st = doc.createElement('style');
-    st.textContent = reglas.join('\n');
-    doc.head.appendChild(st);
-    const cargas = [];
-    familias.forEach(fam => ['400 normal', '700 normal', '400 italic', '700 italic'].forEach(v => {
-      const [p, e] = v.split(' ');
-      cargas.push(doc.fonts.load(`${e} ${p} 16px "cpdf-${fam}"`).catch(() => null));
-    }));
-    await Promise.all(cargas);
-    await doc.fonts.ready;
-    return { bytes, urls };
+    return { bytes, urls: [], problemas };
   }
 
   // ------------------------------------------------------------------ recolección de elementos
@@ -305,12 +317,20 @@ img{max-width:100%!important}
     const win = marco.contentWindow, doc = marco.contentDocument;
     let fuentes;
     try {
+      const avisar = o.alProgresar || (() => {});
+      avisar('Maquetando el correo: preparando listas y fuentes…');
       prepararListas(doc, win);
       const familias = mapearFuentes(doc, win);
-      fuentes = await cargarFuentes(doc, familias, o.cargarFuente);
-      // esperar imágenes
-      await Promise.all(Array.from(doc.images).map(im => im.complete ? null : new Promise(r => { im.onload = im.onerror = r; })));
-      await cuadro(win); await cuadro(win);
+      fuentes = await cargarFuentes(doc, win, familias, o.cargarFuente, avisar);
+      diag.push(...fuentes.problemas.map(p => ({ fuente: p })));
+      // Esperar imágenes (máximo 10 s; una imagen que no carga no detiene el proceso)
+      avisar('Maquetando el correo: cargando imágenes…');
+      await conLimite(Promise.all(Array.from(doc.images).map(im => im.complete ? null
+        : new Promise(r => { im.addEventListener('load', r, { once: true }); im.addEventListener('error', r, { once: true }); }))), 10000, null);
+      // Forzar el cálculo de la maquetación (sin depender del pintado de pantalla)
+      void doc.body.getBoundingClientRect();
+      void doc.documentElement.offsetHeight;
+      avisar('Maquetando el correo: midiendo textos e imágenes…');
 
       const anchoReal = Math.max(doc.documentElement.scrollWidth, doc.body.scrollWidth, o.anchoPx);
       const escala = Math.min(1, o.anchoPx / anchoReal);
