@@ -7,9 +7,12 @@
   <!-- Office.js debe cargarse desde el CDN de Microsoft -->
   <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
   <!-- Librerías locales: ningún dato sale del equipo -->
-  <script src="lib/pdf-lib.min.js"></script>
-  <script src="core.js"></script>
-  <link rel="stylesheet" href="taskpane.css">
+  <script src="lib/pdf-lib.min.js?v=0.2.0"></script>
+  <script src="fuentes.js?v=0.2.0"></script>
+  <script src="mime.js?v=0.2.0"></script>
+  <script src="core.js?v=0.2.0"></script>
+  <script src="renderer.js?v=0.2.0"></script>
+  <link rel="stylesheet" href="taskpane.css?v=0.2.0">
 </head>
 <body>
   <header>
@@ -35,7 +38,6 @@
     </section>
 
     <section class="tarjeta">
-      <label class="opcion"><input type="checkbox" id="incluir-en-linea"> Incluir imágenes incrustadas en el cuerpo (firmas, logos)</label>
       <button id="generar" class="primario" disabled>Generar PDF</button>
       <div id="progreso" class="suave oculto"></div>
     </section>
@@ -50,6 +52,7 @@
         <summary>Huella del PDF generado (SHA-256)</summary>
         <code id="huella"></code>
       </details>
+      <button id="diagnostico" class="enlace-sutil">Descargar diagnóstico técnico (sin contenido del correo)</button>
     </section>
 
     <section id="error" class="tarjeta alerta oculto"></section>
@@ -59,6 +62,6 @@
     <span id="version"></span> · Todo se procesa en este equipo; el correo no se envía a ningún servidor.
   </footer>
 
-  <script src="taskpane.js"></script>
+  <script src="taskpane.js?v=0.2.0"></script>
 </body>
 </html>

@@ -1,11 +1,12 @@
 /*!
  * Correo a PDF — motor de armado (core)
- * Prototipo v0.1.0 — Unidad de Transformación Digital, Rama Judicial
+ * Prototipo v0.2.0 — Unidad de Transformación Digital, Rama Judicial
  *
- * Arma un único PDF con:
- *   1. Carátula (datos del correo, índice, estado de cada anexo, hashes SHA-256)
- *   2. Cuerpo del correo (texto) y enlaces encontrados (clicables)
- *   3. Anexos PDF e imágenes, unidos en orden
+ * Arma un único PDF (tamaño oficio) con:
+ *   1. El correo tal como se ve: encabezado tipo Outlook y cuerpo HTML redibujado
+ *      como texto vectorial (tablas, negritas, firmas e imágenes en su sitio)
+ *   2. Anexos PDF e imágenes, unidos en orden
+ *   3. Hoja de control (temporal): índice, estado de cada archivo y huellas SHA-256
  * Los archivos que no son PDF ni imagen NO se convierten: se alertan y se
  * registran en la carátula.
  *
@@ -25,9 +26,11 @@
     PDFDocument, StandardFonts, rgb, PDFName, PDFString, PDFHexString, PDFNull
   } = PDFLib;
 
-  const VERSION = '0.1.0';
+  const Fuentes = (typeof CorreoFuentes !== 'undefined') ? CorreoFuentes : require('./fuentes.js');
+
+  const VERSION = '0.2.0';
   const LIMITE_BYTES = 100 * 1024 * 1024; // 100 MB por correo
-  const CARTA = [612, 792];
+  const PAGINA = [612, 936]; // oficio colombiano: 21,6 x 33 cm
   const MARGEN = 50;
   const ZONA_HORARIA = 'America/Bogota';
 
@@ -244,16 +247,16 @@
     constructor(doc, fuentes) {
       this.doc = doc;
       this.f = fuentes;
-      this.anchoUtil = CARTA[0] - 2 * MARGEN;
+      this.anchoUtil = PAGINA[0] - 2 * MARGEN;
       this.paginas = [];
       this.cacheCaracteres = new Map();
       this.nuevaPagina();
     }
 
     nuevaPagina() {
-      this.pagina = this.doc.addPage(CARTA);
+      this.pagina = this.doc.addPage(PAGINA);
       this.paginas.push(this.pagina);
-      this.y = CARTA[1] - MARGEN;
+      this.y = PAGINA[1] - MARGEN;
     }
 
     asegurar(alto) {
@@ -343,7 +346,7 @@
     linea() {
       this.asegurar(10);
       this.y -= 6;
-      this.pagina.drawLine({ start: { x: MARGEN, y: this.y }, end: { x: CARTA[0] - MARGEN, y: this.y }, thickness: 0.6, color: COLOR.linea });
+      this.pagina.drawLine({ start: { x: MARGEN, y: this.y }, end: { x: PAGINA[0] - MARGEN, y: this.y }, thickness: 0.6, color: COLOR.linea });
       this.y -= 6;
     }
 
@@ -450,9 +453,16 @@
       const tipo = detectarTipo(a.bytes, r.nombre);
       r.descripcion = tipo.descripcion;
 
+      if (a.enCuerpo) {
+        r.estado = 'en_cuerpo';
+        r.motivo = 'Imagen del cuerpo del correo: se muestra en su lugar dentro del correo.';
+        resultado.push(r);
+        continue;
+      }
+
       if (a.enLinea && !opciones.incluirImagenesEnLinea) {
         r.estado = 'omitido';
-        r.motivo = 'Imagen incrustada en el cuerpo del correo (firma, logo). No se incluyó.';
+        r.motivo = 'Marcada por Outlook como imagen incrustada, pero no aparece en el cuerpo del correo. No se incluyó.';
         resultado.push(r);
         continue;
       }
@@ -505,7 +515,166 @@
   // Carátula + cuerpo + enlaces
   // ---------------------------------------------------------------------------
 
-  async function construirFrente(datos, anexos, enlaces, radicados, rangos, totalPaginas, opciones) {
+  // ---------------------------------------------------------------------------
+  // Encabezado tipo Outlook (se maqueta con el mismo motor que el cuerpo)
+  // ---------------------------------------------------------------------------
+
+  const esc = s => String(s == null ? '' : s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+  function fechaOutlook(fecha, zona) {
+    const d = fecha instanceof Date ? fecha : new Date(fecha);
+    if (isNaN(d)) return String(fecha || '');
+    const dia = new Intl.DateTimeFormat('es-CO', { timeZone: zona, weekday: 'short' }).format(d).replace(/\./g, '');
+    const p = partesFecha(d, zona);
+    return `${dia.charAt(0).toUpperCase()}${dia.slice(1)} ${p.day}/${p.month}/${p.year} ${p.hour === '24' ? '00' : p.hour}:${p.minute}`;
+  }
+
+  function htmlEncabezado(meta, zona) {
+    const m = meta || {};
+    const fila = (etq, val) => val ? `<tr><td style="font-weight:700;padding:2px 12px 2px 2px;vertical-align:top;white-space:nowrap">${etq}</td>` +
+      `<td style="padding:2px 0;vertical-align:top">${esc(val)}</td></tr>` : '';
+    return `<div style="font-family:'Segoe UI',sans-serif;color:#242424;font-size:12px">
+<div style="border-top:1px solid #c8c8c8;border-bottom:1px solid #c8c8c8;padding:9px 0 9px 2px;margin-bottom:12px;font-size:15px;font-weight:700;line-height:1.35">${esc(m.asunto || '(sin asunto)')}</div>
+<table style="border-collapse:collapse;font-size:12px;line-height:1.4">
+${fila('Desde', m.de)}${fila('Fecha', m.recibido ? fechaOutlook(m.recibido, zona || ZONA_HORARIA) : '')}${fila('Para', (m.para || []).join('; '))}${fila('CC', (m.cc || []).join('; '))}
+</table><div style="height:16px"></div></div>`;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Composición del correo en páginas (texto vectorial con fuentes incrustadas)
+  // ---------------------------------------------------------------------------
+
+  const M = { sup: 40, inf: 46, izq: 40, der: 40 };
+  const ANCHO_PT = PAGINA[0] - M.izq - M.der;   // 532 pt
+  const ANCHO_PX = Math.round(ANCHO_PT / 0.75); // ancho de maquetación en píxeles CSS
+  const ALTO_UTIL = PAGINA[1] - M.sup - M.inf;
+
+  function aplanar(segmentos) {
+    const flujo = [];
+    let desfase = 0;
+    segmentos.forEach(seg => {
+      const k = (ANCHO_PT / (seg.anchoPx || ANCHO_PX)) * (seg.escala || 1);
+      seg.items.forEach(it => {
+        const n = Object.assign({}, it);
+        n.x = it.x * k; n.y = it.y * k + desfase;
+        if (it.w != null) n.w = it.w * k;
+        if (it.h != null) n.h = it.h * k;
+        if (it.tam != null) n.tam = it.tam * k;
+        if (it.ancho != null) n.ancho = it.ancho * k;
+        n.sup = it.sup * k + desfase; n.inf = it.inf * k + desfase;
+        flujo.push(n);
+      });
+      desfase += seg.altoPx * k;
+    });
+    return { flujo, alto: desfase };
+  }
+
+  function calcularCortes(flujo, alto) {
+    const intervalos = flujo
+      .filter(it => (it.t === 'texto' || it.t === 'img') && (it.inf - it.sup) < ALTO_UTIL * 0.9)
+      .map(it => [it.sup, it.inf]);
+    // Fin real del contenido (evita una última página en blanco)
+    const finContenido = flujo.reduce((mx, it) => it.t === 'enlace' ? mx : Math.max(mx, it.inf), 0);
+    const total = Math.min(alto, finContenido + 4) || alto;
+    const cortes = [];
+    let ini = 0;
+    while (ini < total - 0.5) {
+      let c = ini + ALTO_UTIL;
+      if (c >= total) { cortes.push([ini, total]); break; }
+      for (let i = 0; i < 60; i++) {
+        const choques = intervalos.filter(([a, b]) => a < c - 0.01 && b > c + 0.01);
+        if (!choques.length) break;
+        const nc = Math.min(...choques.map(([a]) => a));
+        if (nc <= ini + ALTO_UTIL * 0.25) { c = ini + ALTO_UTIL; break; }
+        c = nc;
+      }
+      cortes.push([ini, c]);
+      ini = c;
+    }
+    if (!cortes.length) cortes.push([0, Math.max(total, 1)]);
+    return cortes;
+  }
+
+  async function componerCorreo(doc, segmentos, imagenes, gestor) {
+    const { pushGraphicsState, popGraphicsState, rectangle, clip, endPath } = PDFLib;
+    const { flujo, alto } = aplanar(segmentos);
+    // Enlazar cada palabra decorada con la siguiente palabra decorada (para líneas continuas)
+    let previo = null;
+    flujo.forEach(it => {
+      if (it.t !== 'texto') return;
+      if (previo && (previo.sub || previo.tach) && ((it.sub && previo.sub) || (it.tach && previo.tach))) previo.siguiente = it;
+      previo = it;
+    });
+    const cortes = calcularCortes(flujo, alto);
+    const nombres = new Map();
+    const embebidas = new Map();
+    const paginas = [];
+
+    async function imagen(clave) {
+      if (embebidas.has(clave)) return embebidas.get(clave);
+      const im = imagenes.get(clave);
+      let e = null;
+      if (im) {
+        try { e = im.formato === 'jpg' ? await doc.embedJpg(im.bytes) : await doc.embedPng(im.bytes); } catch (err) { e = null; }
+      }
+      embebidas.set(clave, e);
+      return e;
+    }
+
+    for (const [ini, fin] of cortes) {
+      const pagina = doc.addPage(PAGINA);
+      paginas.push(pagina);
+      const tope = PAGINA[1] - M.sup;
+      const Y = y => tope - (y - ini);
+      pagina.pushOperators(pushGraphicsState(), rectangle(M.izq - 3, tope - (fin - ini) - 1, ANCHO_PT + 6, (fin - ini) + 2), clip(), endPath());
+      for (const it of flujo) {
+        if (it.t === 'enlace' || it.inf <= ini || it.sup >= fin) continue;
+        if (it.t === 'rect') {
+          if (it.guiones && (it.w > it.h * 2 || it.h > it.w * 2)) {
+            const horizontal = it.w >= it.h;
+            const grosor = horizontal ? it.h : it.w;
+            const patron = it.guiones === 1 ? [grosor, grosor] : [grosor * 3, grosor * 2];
+            pagina.drawLine({
+              start: { x: M.izq + it.x + (horizontal ? 0 : grosor / 2), y: Y(it.y + (horizontal ? grosor / 2 : 0)) },
+              end: { x: M.izq + it.x + (horizontal ? it.w : grosor / 2), y: Y(it.y + (horizontal ? grosor / 2 : it.h)) },
+              thickness: grosor, color: rgb(...it.color), dashArray: patron
+            });
+          } else {
+            pagina.drawRectangle({ x: M.izq + it.x, y: Y(it.y + it.h), width: it.w, height: it.h, color: rgb(...it.color) });
+          }
+        } else if (it.t === 'img') {
+          const e = await imagen(it.clave);
+          if (e) pagina.drawImage(e, { x: M.izq + it.x, y: Y(it.y + it.h), width: it.w, height: it.h });
+        } else if (it.t === 'texto') {
+          Fuentes.dibujarTexto(pagina, gestor, it.cara, it.txt, M.izq + it.x, Y(it.y), it.tam, it.color, nombres);
+          const grosor = Math.max(0.45, it.tam * 0.055);
+          // Subrayado/tachado continuo hasta la siguiente palabra decorada de la misma línea
+          let anchoLinea = it.ancho != null ? it.ancho : gestor.anchoTexto(it.cara, it.txt.trimEnd(), it.tam);
+          const sig = it.siguiente;
+          if (sig && /\s$/.test(it.txt) && Math.abs(sig.y - it.y) < 0.6 && sig.x > it.x && sig.x - (it.x + anchoLinea) < it.tam * 0.8) {
+            anchoLinea = sig.x - it.x;
+          }
+          if (it.sub) pagina.drawRectangle({ x: M.izq + it.x, y: Y(it.y) - it.tam * 0.11 - grosor, width: anchoLinea, height: grosor, color: rgb(...it.sub) });
+          if (it.tach && !(sig && sig.tach)) anchoLinea = it.ancho != null ? it.ancho : anchoLinea;
+          if (it.tach) pagina.drawRectangle({ x: M.izq + it.x, y: Y(it.y) + it.tam * 0.27, width: anchoLinea, height: grosor, color: rgb(...it.tach) });
+        }
+      }
+      pagina.pushOperators(popGraphicsState());
+      // Enlaces clicables
+      flujo.forEach(it => {
+        if (it.t !== 'enlace' || it.sup < ini - 0.5 || it.sup >= fin) return;
+        const caja = { pagina, x: M.izq + it.x, y: Y(Math.min(it.inf, fin)), w: it.w, h: Math.min(it.inf, fin) - it.sup };
+        agregarEnlace(doc, caja, it.url);
+      });
+    }
+    return paginas.length;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Hoja de control (temporal, al final)
+  // ---------------------------------------------------------------------------
+
+  async function construirHojaControl(datos, anexos, enlaces, radicados, rangos, opciones) {
     const doc = await PDFDocument.create();
     const fuentes = {
       normal: await doc.embedFont(StandardFonts.Helvetica),
@@ -514,15 +683,14 @@
     };
     const e = new Escritor(doc, fuentes);
     const m = datos.meta || {};
-    const marcas = [];
+    const pags = r => r[0] === r[1] ? 'página ' + r[0] : 'páginas ' + r[0] + ' a ' + r[1];
 
-    // Encabezado
     e.texto('RAMA JUDICIAL DEL PODER PÚBLICO', { negrita: true, tam: 8.5, color: COLOR.suave });
     e.texto(opciones.nombreDespacho || 'Secretaría', { tam: 8.5, color: COLOR.suave });
     e.espacio(6);
-    e.texto('CORREO ELECTRÓNICO RECIBIDO Y SUS ANEXOS', { negrita: true, tam: 15 });
+    e.texto('HOJA DE CONTROL DEL DOCUMENTO', { negrita: true, tam: 15 });
+    e.texto('Información de verificación generada automáticamente (versión de prueba).', { tam: 8.5, color: COLOR.suave });
     e.linea();
-    marcas.push({ titulo: 'Carátula', pagina: e.paginas.length - 1 });
 
     e.campo('Asunto', m.asunto || '(sin asunto)');
     e.campo('De', m.de || '—');
@@ -533,30 +701,29 @@
     e.campo('Radicado detectado', radicados.length
       ? radicados.map(formatoRadicado).join('  |  ') + '  (verificar)'
       : 'No se detectó un número de radicado de 23 dígitos.');
+    e.campo('Fuente del correo', datos.origen === 'eml' ? 'Mensaje original completo (MIME)' : 'Cuerpo y adjuntos leídos por separado');
 
     const noConvertidos = anexos.filter(a => a.estado === 'no_convertido');
     if (noConvertidos.length) {
       e.espacio(4);
       e.recuadroAlerta([
         `ATENCIÓN: ${noConvertidos.length} archivo(s) recibido(s) NO se convirtieron y NO están incluidos en este PDF.`,
-        'Revise la lista de anexos abajo. Conserve el correo original y gestione esos archivos por separado.'
+        'Revise la lista de archivos. Conserve el correo original y gestione esos archivos por separado.'
       ]);
     }
+    if (datos.externas) {
+      e.espacio(2);
+      e.texto(`Nota: ${datos.externas} imagen(es) externa(s) del cuerpo (alojadas en internet) no se incluyeron; aparecen como un recuadro.`, { tam: 8.5, color: COLOR.suave });
+    }
 
-    // Índice
     e.titulo('ÍNDICE DEL DOCUMENTO');
-    e.texto(`Carátula y cuerpo del correo .......... páginas 1 a ${rangos.finFrente}`, { tam: 9.5 });
-    anexos.forEach((a, i) => {
-      if (a.estado === 'incluido') {
-        const r = rangos.porAnexo[i];
-        e.texto(`Anexo ${i + 1}: ${a.nombre} .......... ${r[0] === r[1] ? 'página ' + r[0] : 'páginas ' + r[0] + ' a ' + r[1]}`, { tam: 9.5 });
-      }
-    });
-    e.texto(`Total de páginas: ${totalPaginas}`, { tam: 9.5, negrita: true });
+    e.texto(`Correo electrónico .......... ${pags(rangos.correo)}`, { tam: 9.5 });
+    anexos.forEach((a, i) => { if (a.estado === 'incluido') e.texto(`Anexo ${rangos.numero[i]}: ${a.nombre} .......... ${pags(rangos.porAnexo[i])}`, { tam: 9.5 }); });
+    e.texto(`Hoja de control .......... ${pags(rangos.hoja)}`, { tam: 9.5 });
+    e.texto(`Total de páginas: ${rangos.total}`, { tam: 9.5, negrita: true });
 
-    // Detalle de anexos
-    e.titulo(`ARCHIVOS RECIBIDOS (${anexos.length})`);
-    e.texto('El SHA-256 es la huella digital de cada archivo tal como llegó en el correo; permite verificar que un archivo es el mismo recibido.', { tam: 7.5, color: COLOR.suave });
+    e.titulo(`ARCHIVOS RECIBIDOS EN EL CORREO (${anexos.length})`);
+    e.texto('El SHA-256 es la huella digital de cada archivo tal como llegó; permite verificar que un archivo es el mismo recibido.', { tam: 7.5, color: COLOR.suave });
     e.espacio(4);
     if (!anexos.length) e.texto('El correo no traía archivos adjuntos.', { tam: 9.5, color: COLOR.suave });
     anexos.forEach((a, i) => {
@@ -564,60 +731,31 @@
       e.texto(`${i + 1}. ${a.nombre}`, { negrita: true, tam: 9.5 });
       e.texto(`Tipo: ${a.descripcion || '—'}   ·   Tamaño: ${tamanoLegible(a.tamano)}`, { tam: 8.5, sangria: 12, color: COLOR.suave });
       let estado, color;
-      if (a.estado === 'incluido') {
-        const r = rangos.porAnexo[i];
-        estado = `Incluido en este PDF (${r[0] === r[1] ? 'página ' + r[0] : 'páginas ' + r[0] + ' a ' + r[1]})`;
-        color = COLOR.ok;
-      } else if (a.estado === 'enlace') {
-        estado = 'Archivo en la nube: incluido como enlace (ver sección de enlaces)';
-        color = COLOR.enlace;
-      } else if (a.estado === 'omitido') {
-        estado = 'Omitido: ' + a.motivo;
-        color = COLOR.suave;
-      } else {
-        estado = 'NO CONVERTIDO: ' + a.motivo;
-        color = COLOR.alerta;
-      }
+      if (a.estado === 'incluido') { estado = `Incluido como anexo ${rangos.numero[i]} (${pags(rangos.porAnexo[i])})`; color = COLOR.ok; }
+      else if (a.estado === 'en_cuerpo') { estado = 'Imagen del cuerpo: se muestra en su lugar dentro del correo'; color = COLOR.ok; }
+      else if (a.estado === 'enlace') { estado = 'Archivo en la nube: incluido como enlace'; color = COLOR.enlace; }
+      else if (a.estado === 'omitido') { estado = 'Omitido: ' + a.motivo; color = COLOR.suave; }
+      else { estado = 'NO CONVERTIDO: ' + a.motivo; color = COLOR.alerta; }
       e.texto(estado, { tam: 8.5, sangria: 12, color, negrita: a.estado === 'no_convertido' });
       if (a.sha256) e.texto('SHA-256: ' + a.sha256, { tam: 7, sangria: 12, mono: true, color: COLOR.suave });
       e.espacio(3);
     });
 
-
-    // Cuerpo
-    e.nuevaPagina();
-    marcas.push({ titulo: 'Cuerpo del correo', pagina: e.paginas.length - 1 });
-    e.titulo('CUERPO DEL CORREO');
-    const cuerpo = (datos.cuerpoTexto || '').replace(/\n{3,}/g, '\n\n').trim();
-    e.texto(cuerpo || '(El correo no tiene texto en el cuerpo.)', { tam: 10 });
-
-    // Enlaces
-    e.espacio(10);
-    e.titulo(`ENLACES ENCONTRADOS EN EL CORREO (${enlaces.length})`);
-    marcas.push({ titulo: 'Enlaces del correo', pagina: e.paginas.length - 1 });
-    if (!enlaces.length) {
-      e.texto('El correo no contiene enlaces.', { tam: 9.5, color: COLOR.suave });
-    } else {
-      e.texto('Los enlaces NO fueron abiertos ni descargados; su contenido no está incluido en este PDF. Haga clic para abrirlos.', { tam: 8.5, color: COLOR.suave });
-      e.espacio(4);
+    e.titulo(`ENLACES DEL CORREO (${enlaces.length})`);
+    if (!enlaces.length) e.texto('El correo no contiene enlaces.', { tam: 9.5, color: COLOR.suave });
+    else {
+      e.texto('Los enlaces no fueron abiertos ni descargados; su contenido no está incluido en este PDF.', { tam: 8.5, color: COLOR.suave });
+      e.espacio(3);
       enlaces.forEach((l, i) => {
-        e.asegurar(30);
+        e.asegurar(24);
         if (l.etiqueta) e.texto(`${i + 1}. ${l.etiqueta}`, { tam: 9, negrita: true });
-        const cajas = e.texto((l.etiqueta ? '   ' : `${i + 1}. `) + l.url, { tam: 9, color: COLOR.enlace });
+        const cajas = e.texto((l.etiqueta ? '   ' : `${i + 1}. `) + l.url, { tam: 8.5, color: COLOR.enlace });
         cajas.forEach(c => agregarEnlace(doc, c, l.url));
-        if (l.safelinks) e.texto('(Enlace original, extraído de la protección Safe Links de Microsoft)', { tam: 7.5, sangria: 12, color: COLOR.suave });
-        e.espacio(2);
+        if (l.safelinks) e.texto('(enlace original, extraído de la protección Safe Links de Microsoft)', { tam: 7.5, sangria: 12, color: COLOR.suave });
+        e.espacio(1);
       });
     }
-
-    // Pie de página en las páginas generadas
-    const generado = fechaLegible(opciones.ahora || new Date(), opciones.zonaHoraria);
-    e.paginas.forEach((p, i) => {
-      const pie = `Generado con Correo a PDF v${VERSION} (prototipo) · ${generado} · Página ${i + 1} de ${totalPaginas}`;
-      p.drawText(e.limpiar(pie, fuentes.normal), { x: MARGEN, y: 28, size: 7, font: fuentes.normal, color: COLOR.suave });
-    });
-
-    return { doc, paginas: e.paginas.length, marcas };
+    return { doc, paginas: e.paginas.length };
   }
 
   // ---------------------------------------------------------------------------
@@ -626,13 +764,8 @@
 
   /**
    * @param {object} datos
-   *   meta: { asunto, de, para[], cc[], recibido (Date|string), idMensaje }
-   *   cuerpoTexto: string
-   *   enlaces: [string | {url, etiqueta}]
-   *   anexos: [{ nombre, tamano, tipo: 'archivo'|'nube'|'item', enLinea, bytes: Uint8Array, url, error }]
-   * @param {object} opciones
-   *   incluirImagenesEnLinea, convertirImagen(bytes, formatoOrigen, destino) -> Uint8Array,
-   *   nombreDespacho, zonaHoraria, ahora, alProgresar(msg)
+   *   meta, segmentos [{items, altoPx, escala, anchoPx}], imagenes Map(clave→{bytes,formato}),
+   *   fuentes {cara: Uint8Array}, anexos [...], enlaces [...], cuerpoTexto, externas, origen
    */
   async function generarPdf(datos, opciones = {}) {
     opciones = Object.assign({ zonaHoraria: ZONA_HORARIA, incluirImagenesEnLinea: false }, opciones);
@@ -645,60 +778,76 @@
     }
 
     const anexos = await prepararAnexos(anexosEntrada, opciones, avisar);
-
-    // Enlaces: los del cuerpo + archivos en la nube
     const enlaces = normalizarEnlaces([
       ...(datos.enlaces || []),
-      ...enlacesDeTexto(datos.cuerpoTexto),
       ...anexos.filter(a => a.estado === 'enlace' && a.url).map(a => ({ url: a.url, etiqueta: 'Archivo en la nube: ' + a.nombre }))
     ]);
-    const radicados = detectarRadicados(datos.meta && datos.meta.asunto, datos.cuerpoTexto);
+    const m = datos.meta || {};
+    const radicados = detectarRadicados(m.asunto, datos.cuerpoTexto);
 
-    const paginasAnexos = anexos.reduce((s, a) => s + (a.estado === 'incluido' ? a.paginas : 0), 0);
+    avisar('Dibujando el correo…');
+    const doc = await PDFDocument.create();
+    const gestor = new Fuentes.GestorFuentes(doc, datos.fuentes || {});
+    const paginasCorreo = await componerCorreo(doc, datos.segmentos || [], datos.imagenes || new Map(), gestor);
 
-    // Dos pasadas: la carátula necesita conocer sus propias páginas
-    avisar('Armando carátula y cuerpo del correo…');
-    let paginasFrente = 2;
-    let frente;
-    for (let intento = 0; intento < 4; intento++) {
-      const rangos = { finFrente: paginasFrente, porAnexo: {} };
-      let cursor = paginasFrente + 1;
-      anexos.forEach((a, i) => {
-        if (a.estado === 'incluido') { rangos.porAnexo[i] = [cursor, cursor + a.paginas - 1]; cursor += a.paginas; }
-      });
-      frente = await construirFrente(datos, anexos, enlaces, radicados, rangos, paginasFrente + paginasAnexos, opciones);
-      frente.rangos = rangos;
-      if (frente.paginas === paginasFrente) break;
-      paginasFrente = frente.paginas;
-    }
-
-    const doc = frente.doc;
-    const marcadores = frente.marcas.map(mk => ({ titulo: mk.titulo, indicePagina: mk.pagina }));
-
+    // Anexos
+    const marcadores = [{ titulo: 'Correo electrónico', indicePagina: 0 }];
+    const rangos = { correo: [1, paginasCorreo], porAnexo: {}, numero: {} };
+    let numero = 0;
     for (let i = 0; i < anexos.length; i++) {
       const a = anexos[i];
       if (a.estado !== 'incluido') continue;
-      avisar(`Uniendo anexo ${i + 1}: ${a.nombre}`);
-      const indiceInicio = doc.getPageCount();
+      numero++;
+      avisar(`Uniendo anexo ${numero}: ${a.nombre}`);
+      const inicio = doc.getPageCount();
       if (a.recurso.clase === 'pdf') {
         const paginas = await doc.copyPages(a.recurso.pdf, a.recurso.pdf.getPageIndices());
         paginas.forEach(p => doc.addPage(p));
       } else {
         const img = a.recurso.formato === 'png' ? await doc.embedPng(a.recurso.bytes) : await doc.embedJpg(a.recurso.bytes);
         const horizontal = img.width > img.height;
-        const [pw, ph] = horizontal ? [CARTA[1], CARTA[0]] : CARTA;
+        const [pw, ph] = horizontal ? [PAGINA[1], PAGINA[0]] : PAGINA;
         const margen = 36;
         const escala = Math.min((pw - 2 * margen) / img.width, (ph - 2 * margen) / img.height, 1.5);
         const w = img.width * escala, h = img.height * escala;
         const pagina = doc.addPage([pw, ph]);
         pagina.drawImage(img, { x: (pw - w) / 2, y: (ph - h) / 2, width: w, height: h });
       }
-      marcadores.push({ titulo: `Anexo ${i + 1}: ${a.nombre}`, indicePagina: indiceInicio });
+      rangos.porAnexo[i] = [inicio + 1, doc.getPageCount()];
+      rangos.numero[i] = numero;
+      marcadores.push({ titulo: `Anexo ${numero}: ${a.nombre}`, indicePagina: inicio });
     }
 
-    agregarMarcadores(doc, marcadores);
+    // Hoja de control (dos pasadas: necesita conocer su propio número de páginas)
+    avisar('Armando la hoja de control…');
+    const inicioHoja = doc.getPageCount() + 1;
+    let paginasHoja = 1, hoja;
+    for (let intento = 0; intento < 4; intento++) {
+      rangos.hoja = [inicioHoja, inicioHoja + paginasHoja - 1];
+      rangos.total = inicioHoja + paginasHoja - 1;
+      hoja = await construirHojaControl(datos, anexos, enlaces, radicados, rangos, opciones);
+      if (hoja.paginas === paginasHoja) break;
+      paginasHoja = hoja.paginas;
+    }
+    const copiadas = await doc.copyPages(hoja.doc, hoja.doc.getPageIndices());
+    copiadas.forEach(p => doc.addPage(p));
+    marcadores.push({ titulo: 'Hoja de control', indicePagina: inicioHoja - 1 });
 
-    const m = datos.meta || {};
+    // Pie de página en las páginas propias (correo y hoja de control)
+    const total = doc.getPageCount();
+    const helv = await doc.embedFont(StandardFonts.Helvetica);
+    const pie = (i) => {
+      const p = doc.getPage(i);
+      const { width } = p.getSize();
+      const t = `Página ${i + 1} de ${total}`;
+      p.drawText(t, { x: width - M.der - helv.widthOfTextAtSize(t, 7.5), y: 22, size: 7.5, font: helv, color: COLOR.suave });
+      p.drawText(`Correo a PDF v${VERSION} (prototipo)`, { x: M.izq, y: 22, size: 7, font: helv, color: COLOR.suave });
+    };
+    for (let i = 0; i < paginasCorreo; i++) pie(i);
+    for (let i = inicioHoja - 1; i < total; i++) pie(i);
+
+    gestor.finalizar();
+    agregarMarcadores(doc, marcadores);
     doc.setTitle(m.asunto || 'Correo electrónico');
     doc.setSubject('Correo de ' + (m.de || 'remitente desconocido') + ' con sus anexos');
     doc.setAuthor('Correo a PDF v' + VERSION);
@@ -710,18 +859,13 @@
     avisar('Guardando PDF…');
     const bytes = await doc.save();
     const huella = await sha256(bytes);
-
     const p = partesFecha(m.recibido || new Date(), opciones.zonaHoraria);
     const nombreArchivo = `${p.year}${p.month}${p.day}_${p.hour}${p.minute}_` +
       `${radicados[0] || 'sin-radicado'}_${slug(m.asunto, 40)}.pdf`;
 
     return {
-      bytes,
-      nombreArchivo,
-      sha256: huella,
-      totalPaginas: doc.getPageCount(),
-      radicados: radicados.map(formatoRadicado),
-      enlaces,
+      bytes, nombreArchivo, sha256: huella, totalPaginas: total, paginasCorreo,
+      radicados: radicados.map(formatoRadicado), enlaces,
       anexos: anexos.map(a => ({
         nombre: a.nombre, descripcion: a.descripcion, tamano: a.tamano, estado: a.estado,
         motivo: a.motivo, sha256: a.sha256, paginas: a.estado === 'incluido' ? a.paginas : 0
@@ -730,8 +874,8 @@
   }
 
   return {
-    VERSION, LIMITE_BYTES,
-    generarPdf, prediccionPorNombre, detectarTipo, detectarRadicados, formatoRadicado,
-    normalizarEnlaces, enlacesDeTexto, tamanoLegible, orientacionExif
+    VERSION, LIMITE_BYTES, PAGINA, ANCHO_PX,
+    generarPdf, htmlEncabezado, fechaOutlook, prediccionPorNombre, detectarTipo, detectarRadicados, formatoRadicado,
+    normalizarEnlaces, enlacesDeTexto, tamanoLegible, orientacionExif, calcularCortes
   };
 });

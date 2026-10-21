@@ -1,9 +1,11 @@
-/* Correo a PDF — panel del complemento de Outlook (prototipo v0.1.0) */
+/* Correo a PDF — panel del complemento de Outlook (prototipo v0.2.0) */
 (function () {
   'use strict';
 
   const $ = id => document.getElementById(id);
   let urlPdf = null;
+  let ultimoDiagnostico = null;
+  const cacheFuentes = new Map();
 
   Office.onReady(info => {
     $('version').textContent = 'v' + CorreoPDF.VERSION;
@@ -13,7 +15,7 @@
     }
     $('generar').addEventListener('click', generar);
     $('abrir').addEventListener('click', () => { if (urlPdf) window.open(urlPdf, '_blank'); });
-    // Panel anclado: actualizar cuando el usuario cambia de correo
+    $('diagnostico').addEventListener('click', descargarDiagnostico);
     if (Office.context.mailbox.addHandlerAsync) {
       Office.context.mailbox.addHandlerAsync(Office.EventType.ItemChanged, cargarCorreo);
     }
@@ -34,60 +36,90 @@
     $('sin-correo').classList.add('oculto');
     $('correo').classList.remove('oculto');
     $('asunto').textContent = item.subject || '(sin asunto)';
-    $('remitente').textContent = 'De: ' + persona(item.from) + ' · ' + formatoFecha(item.dateTimeCreated);
+    $('remitente').textContent = 'De: ' + persona(item.from) + ' · ' + CorreoPDF.fechaOutlook(item.dateTimeCreated, 'America/Bogota');
 
     const adjuntos = item.attachments || [];
     const lista = $('lista-anexos');
     lista.innerHTML = '';
     $('anexos-caja').classList.remove('oculto');
     $('conteo').textContent = '(' + adjuntos.length + ')';
-
     let noConvertibles = 0;
-    if (!adjuntos.length) {
-      const li = document.createElement('li');
-      li.className = 'info';
-      li.innerHTML = '<span class="icono">i</span><span>El correo no trae adjuntos. Se generará el PDF del cuerpo y sus enlaces.</span>';
-      lista.appendChild(li);
-    }
+    if (!adjuntos.length) agregarFila(lista, 'info', 'i', 'El correo no trae adjuntos.', 'Se generará el PDF del correo con sus enlaces.');
     adjuntos.forEach(a => {
-      let clase, icono, detalle;
-      if (a.attachmentType === 'cloud') {
-        clase = 'info'; icono = '↗'; detalle = 'Archivo en la nube: se incluirá como enlace';
-      } else if (a.attachmentType === 'item') {
-        clase = 'no'; icono = '!'; detalle = 'Correo adjunto: no se convierte en esta versión';
-        noConvertibles++;
-      } else {
-        const p = CorreoPDF.prediccionPorNombre(a.name);
-        if (a.isInline) {
-          clase = 'info'; icono = '·'; detalle = 'Imagen incrustada en el cuerpo';
-        } else if (p.soportado) {
-          clase = 'ok'; icono = '✓'; detalle = p.descripcion + ' · se unirá al PDF';
-        } else {
-          clase = 'no'; icono = '!'; detalle = p.descripcion + ' · NO se puede convertir a PDF';
-          noConvertibles++;
-        }
-      }
-      const li = document.createElement('li');
-      li.className = clase;
-      const i = document.createElement('span'); i.className = 'icono'; i.textContent = icono;
-      const t = document.createElement('span');
-      const n = document.createElement('span'); n.className = 'nombre'; n.textContent = a.name;
-      const d = document.createElement('span'); d.className = 'detalle';
-      d.textContent = detalle + (a.size ? ' · ' + CorreoPDF.tamanoLegible(a.size) : '');
-      t.appendChild(n); t.appendChild(d);
-      li.appendChild(i); li.appendChild(t);
-      lista.appendChild(li);
+      const tam = a.size ? ' · ' + CorreoPDF.tamanoLegible(a.size) : '';
+      if (a.attachmentType === 'cloud') return agregarFila(lista, 'info', '↗', a.name, 'Archivo en la nube: se incluirá como enlace' + tam);
+      if (a.attachmentType === 'item') { noConvertibles++; return agregarFila(lista, 'no', '!', a.name, 'Correo adjunto: no se convierte en esta versión' + tam); }
+      const p = CorreoPDF.prediccionPorNombre(a.name);
+      if (p.descripcion === 'Imagen') return agregarFila(lista, 'ok', '✓', a.name, 'Imagen: si aparece en el cuerpo se muestra en su lugar; si no, se une como anexo' + tam);
+      if (p.soportado) return agregarFila(lista, 'ok', '✓', a.name, p.descripcion + ' · se unirá al PDF' + tam);
+      noConvertibles++;
+      agregarFila(lista, 'no', '!', a.name, p.descripcion + ' · NO se puede convertir a PDF' + tam);
     });
-
     const alerta = $('alerta-previa');
     if (noConvertibles) {
       alerta.textContent = `Atención: ${noConvertibles} archivo(s) no son PDF ni imagen y no se pueden convertir. ` +
-        'Quedarán registrados como "no convertidos" en la carátula. Gestiónelos por separado.';
+        'Quedarán registrados como "no convertidos" en la hoja de control. Gestiónelos por separado.';
       alerta.classList.remove('oculto');
-    } else {
-      alerta.classList.add('oculto');
-    }
+    } else alerta.classList.add('oculto');
     $('generar').disabled = false;
+  }
+
+  function agregarFila(lista, clase, icono, nombre, detalle) {
+    const li = document.createElement('li');
+    li.className = clase;
+    const i = document.createElement('span'); i.className = 'icono'; i.textContent = icono;
+    const t = document.createElement('span');
+    const n = document.createElement('span'); n.className = 'nombre'; n.textContent = nombre;
+    const d = document.createElement('span'); d.className = 'detalle'; d.textContent = detalle;
+    t.appendChild(n); t.appendChild(d); li.appendChild(i); li.appendChild(t);
+    lista.appendChild(li);
+  }
+
+  // ------------------------------------------------------------------ lectura del correo
+
+  async function obtenerCorreo(item) {
+    const diag = { origen: null, errores: [] };
+    let html = null, texto = null, partes = [];
+
+    // 1. Mensaje original completo (MIME): HTML original y adjuntos con su Content-ID
+    if (typeof item.getAsFileAsync === 'function') {
+      try {
+        progreso('Leyendo el mensaje original…');
+        const b64 = await promesa(cb => item.getAsFileAsync(cb));
+        const r = CorreoMime.analizar(base64ABytes(b64));
+        html = r.html; texto = r.texto;
+        partes = r.partes.map(p => ({ nombre: p.nombre, tipo: p.tipo, bytes: p.bytes, contentId: p.contentId, enLinea: p.enLinea, esCorreo: p.esCorreo }));
+        diag.origen = 'eml';
+      } catch (e) { diag.errores.push('getAsFileAsync: ' + (e.message || e)); }
+    }
+    // 2. Respaldo: cuerpo y adjuntos por separado
+    if (!diag.origen) {
+      diag.origen = 'api';
+      html = await cuerpo(item, Office.CoercionType.Html).catch(() => null);
+      texto = await cuerpo(item, Office.CoercionType.Text).catch(() => '');
+      const adjuntos = (item.attachments || []).filter(a => a.attachmentType !== 'cloud');
+      for (let i = 0; i < adjuntos.length; i++) {
+        const a = adjuntos[i];
+        progreso(`Leyendo adjunto ${i + 1} de ${adjuntos.length}: ${a.name}`);
+        const base = { nombre: a.name, tipo: a.contentType || '', contentId: a.contentId || '', enLinea: !!a.isInline, idOutlook: a.id, esCorreo: a.attachmentType === 'item' };
+        if (base.esCorreo) { partes.push(Object.assign(base, { bytes: null })); continue; }
+        try {
+          const c = await promesa(cb => item.getAttachmentContentAsync(a.id, cb));
+          partes.push(Object.assign(base, { bytes: c.format === Office.MailboxEnums.AttachmentContentFormat.Base64 ? base64ABytes(c.content) : null }));
+        } catch (e) { partes.push(Object.assign(base, { bytes: null, error: e.message || String(e) })); }
+      }
+    }
+    // Archivos en la nube (no vienen en el MIME)
+    const nube = [];
+    for (const a of (item.attachments || []).filter(x => x.attachmentType === 'cloud')) {
+      try {
+        const c = await promesa(cb => item.getAttachmentContentAsync(a.id, cb));
+        nube.push({ nombre: a.name, url: c.content });
+      } catch (e) { nube.push({ nombre: a.name, url: '' }); }
+    }
+    // Para buscar radicados se usa el texto visible del HTML (la parte de texto plano puede ser un resumen)
+    if (html) texto = new DOMParser().parseFromString(html, 'text/html').body.textContent || texto || '';
+    return { html, texto: texto || '', partes, nube, diag };
   }
 
   // ------------------------------------------------------------------ generación
@@ -97,61 +129,87 @@
     if (!item) return;
     limpiarResultado();
     $('generar').disabled = true;
-    progreso('Leyendo el correo…');
-
+    const urlsTemporales = [];
     try {
-      const [texto, html] = await Promise.all([
-        cuerpo(item, Office.CoercionType.Text),
-        cuerpo(item, Office.CoercionType.Html).catch(() => '')
-      ]);
+      const correo = await obtenerCorreo(item);
+      const meta = {
+        asunto: item.subject, de: persona(item.from),
+        para: (item.to || []).map(persona), cc: (item.cc || []).map(persona),
+        recibido: item.dateTimeCreated, idMensaje: item.internetMessageId
+      };
 
-      const anexos = [];
-      const adjuntos = item.attachments || [];
-      for (let i = 0; i < adjuntos.length; i++) {
-        const a = adjuntos[i];
-        progreso(`Leyendo adjunto ${i + 1} de ${adjuntos.length}: ${a.name}`);
-        const base = { nombre: a.name, tamano: a.size, enLinea: !!a.isInline };
-        if (a.attachmentType === 'item') { anexos.push(Object.assign(base, { tipo: 'item' })); continue; }
-        try {
-          const contenido = await contenidoAdjunto(item, a.id);
-          if (contenido.format === Office.MailboxEnums.AttachmentContentFormat.Url) {
-            anexos.push(Object.assign(base, { tipo: 'nube', url: contenido.content }));
-          } else if (contenido.format === Office.MailboxEnums.AttachmentContentFormat.Base64) {
-            anexos.push(Object.assign(base, { tipo: 'archivo', bytes: base64ABytes(contenido.content) }));
-          } else {
-            anexos.push(Object.assign(base, { tipo: 'item' }));
-          }
-        } catch (e) {
-          anexos.push(Object.assign(base, { tipo: a.attachmentType === 'cloud' ? 'nube' : 'archivo', error: e.message || String(e) }));
-        }
+      // Imágenes candidatas a estar dentro del cuerpo
+      progreso('Preparando imágenes del cuerpo…');
+      const candidatos = [];
+      for (let i = 0; i < correo.partes.length; i++) {
+        const p = correo.partes[i];
+        if (!p.bytes || p.esCorreo) continue;
+        const tipo = CorreoPDF.detectarTipo(p.bytes, p.nombre);
+        if (tipo.categoria !== 'imagen' && tipo.categoria !== 'imagen-convertible') continue;
+        const mime = { png: 'image/png', jpg: 'image/jpeg', gif: 'image/gif', bmp: 'image/bmp', webp: 'image/webp' }[tipo.tipo];
+        const url = URL.createObjectURL(new Blob([p.bytes], { type: mime }));
+        urlsTemporales.push(url);
+        const dim = await CorreoRender.dimensiones(p.bytes, mime);
+        candidatos.push({
+          clave: 'p' + i, nombre: p.nombre, contentId: p.contentId, idOutlook: p.idOutlook, bytes: p.bytes,
+          formato: tipo.tipo, orientacion: tipo.tipo === 'jpg' ? CorreoPDF.orientacionExif(p.bytes) : 1,
+          url, ancho: dim.ancho, alto: dim.alto
+        });
       }
 
-      const resultado = await CorreoPDF.generarPdf({
-        meta: {
-          asunto: item.subject,
-          de: persona(item.from),
-          para: (item.to || []).map(persona),
-          cc: (item.cc || []).map(persona),
-          recibido: item.dateTimeCreated,
-          idMensaje: item.internetMessageId
-        },
-        cuerpoTexto: texto,
-        enlaces: enlacesDeHtml(html),
-        anexos
-      }, {
-        incluirImagenesEnLinea: $('incluir-en-linea').checked,
-        convertirImagen,
-        nombreDespacho: nombreBuzon(),
-        alProgresar: progreso
-      });
+      progreso('Maquetando el correo…');
+      const comunes = { anchoPx: CorreoPDF.ANCHO_PX, cargarFuente };
+      const segEncabezado = await CorreoRender.renderizar(CorreoPDF.htmlEncabezado(meta, 'America/Bogota'), Object.assign({ candidatos: [] }, comunes));
+      const segCuerpo = await CorreoRender.renderizar(correo.html || correo.texto, Object.assign({ candidatos, esTexto: !correo.html }, comunes));
 
+      const anexos = correo.partes.map((p, i) => ({
+        nombre: p.nombre, tamano: p.bytes ? p.bytes.length : null, tipo: p.esCorreo ? 'item' : 'archivo',
+        bytes: p.bytes, enLinea: p.enLinea, enCuerpo: segCuerpo.usadas.has('p' + i), error: p.error
+      })).concat(correo.nube.map(n => ({ nombre: n.nombre, tipo: 'nube', url: n.url })));
+
+      const resultado = await CorreoPDF.generarPdf({
+        meta,
+        segmentos: [
+          Object.assign({ anchoPx: CorreoPDF.ANCHO_PX }, segEncabezado),
+          Object.assign({ anchoPx: CorreoPDF.ANCHO_PX }, segCuerpo)
+        ],
+        imagenes: new Map([...segEncabezado.imagenes, ...segCuerpo.imagenes]),
+        fuentes: Object.assign({}, segEncabezado.fuentes, segCuerpo.fuentes),
+        anexos,
+        enlaces: enlacesDeHtml(correo.html),
+        cuerpoTexto: correo.texto,
+        externas: segCuerpo.externas,
+        origen: correo.diag.origen
+      }, { nombreDespacho: nombreBuzon(), alProgresar: progreso });
+
+      ultimoDiagnostico = {
+        version: CorreoPDF.VERSION, fecha: new Date().toISOString(),
+        cliente: Office.context.diagnostics ? { host: Office.context.diagnostics.hostName, version: Office.context.diagnostics.hostVersion, plataforma: Office.context.diagnostics.platform } : null,
+        origen: correo.diag.origen, errores: correo.diag.errores,
+        htmlCaracteres: correo.html ? correo.html.length : 0,
+        imagenesCuerpo: segCuerpo.diagnostico,
+        partes: correo.partes.map((p, i) => ({ nombre: p.nombre, tipo: p.tipo, bytes: p.bytes ? p.bytes.length : 0, conContentId: !!p.contentId, enLinea: p.enLinea, usadaEnCuerpo: segCuerpo.usadas.has('p' + i) })),
+        paginasCorreo: resultado.paginasCorreo, totalPaginas: resultado.totalPaginas
+      };
       mostrarResultado(resultado);
     } catch (e) {
+      console.error(e);
       mostrarError('No se pudo generar el PDF: ' + (e.message || e));
     } finally {
+      urlsTemporales.forEach(u => URL.revokeObjectURL(u));
       $('progreso').classList.add('oculto');
       $('generar').disabled = false;
     }
+  }
+
+  async function cargarFuente(cara) {
+    if (!cacheFuentes.has(cara)) {
+      cacheFuentes.set(cara, fetch(`fuentes/${cara}.ttf`).then(r => {
+        if (!r.ok) throw new Error('No se pudo cargar la fuente ' + cara);
+        return r.arrayBuffer();
+      }).then(b => new Uint8Array(b)));
+    }
+    return cacheFuentes.get(cara);
   }
 
   function mostrarResultado(r) {
@@ -162,12 +220,13 @@
     enlace.download = r.nombreArchivo;
 
     const incluidos = r.anexos.filter(a => a.estado === 'incluido').length;
+    const enCuerpo = r.anexos.filter(a => a.estado === 'en_cuerpo').length;
     const noConv = r.anexos.filter(a => a.estado === 'no_convertido');
     const resumen = $('resumen');
     resumen.innerHTML = '';
     [
-      `✓ PDF generado: ${r.totalPaginas} páginas`,
-      `Anexos unidos: ${incluidos} de ${r.anexos.length}`,
+      `✓ PDF generado: ${r.totalPaginas} páginas (correo: ${r.paginasCorreo})`,
+      `Anexos unidos: ${incluidos}` + (enCuerpo ? ` · Imágenes dentro del cuerpo: ${enCuerpo}` : ''),
       `Enlaces registrados: ${r.enlaces.length}`,
       r.radicados.length ? `Radicado detectado: ${r.radicados[0]}` : 'Sin radicado detectado',
       `Archivo: ${r.nombreArchivo}`
@@ -182,33 +241,31 @@
       titulo.textContent = `${noConv.length} archivo(s) NO incluidos en el PDF:`;
       div.appendChild(titulo);
       const ul = document.createElement('ul');
-      noConv.forEach(a => {
-        const li = document.createElement('li');
-        li.style.display = 'block';
-        li.textContent = `${a.nombre} — ${a.motivo}`;
-        ul.appendChild(li);
-      });
+      noConv.forEach(a => { const li = document.createElement('li'); li.style.display = 'block'; li.textContent = `${a.nombre} — ${a.motivo}`; ul.appendChild(li); });
       div.appendChild(ul);
       cajaAlertas.appendChild(div);
     }
     $('huella').textContent = r.sha256;
     $('resultado').classList.remove('oculto');
-
-    // Intento de descarga automática (si el entorno la bloquea, queda el botón)
     try { enlace.click(); } catch (e) { /* el usuario usa el botón */ }
+  }
+
+  function descargarDiagnostico() {
+    if (!ultimoDiagnostico) return;
+    const blob = new Blob([JSON.stringify(ultimoDiagnostico, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'diagnostico-correo-a-pdf.json';
+    document.body.appendChild(a); a.click(); a.remove();
   }
 
   // ------------------------------------------------------------------ utilidades Office
 
-  function cuerpo(item, tipo) {
-    return new Promise((ok, mal) => item.body.getAsync(tipo, r =>
-      r.status === Office.AsyncResultStatus.Succeeded ? ok(r.value || '') : mal(r.error)));
+  function promesa(llamar) {
+    return new Promise((ok, mal) => llamar(r => r.status === Office.AsyncResultStatus.Succeeded
+      ? ok(r.value) : mal(new Error(r.error && r.error.message || 'error desconocido'))));
   }
-
-  function contenidoAdjunto(item, id) {
-    return new Promise((ok, mal) => item.getAttachmentContentAsync(id, r =>
-      r.status === Office.AsyncResultStatus.Succeeded ? ok(r.value) : mal(new Error(r.error && r.error.message || 'error desconocido'))));
-  }
+  function cuerpo(item, tipo) { return promesa(cb => item.body.getAsync(tipo, cb)); }
 
   function persona(p) {
     if (!p) return '—';
@@ -223,25 +280,16 @@
     } catch (e) { return 'Secretaría'; }
   }
 
-  function formatoFecha(f) {
-    if (!f) return '';
-    try {
-      return new Intl.DateTimeFormat('es-CO', { timeZone: 'America/Bogota', dateStyle: 'medium', timeStyle: 'short' }).format(new Date(f));
-    } catch (e) { return String(f); }
-  }
-
   function enlacesDeHtml(html) {
     if (!html) return [];
     try {
       const doc = new DOMParser().parseFromString(html, 'text/html');
-      return Array.from(doc.querySelectorAll('a[href]'))
-        .map(a => {
-          const url = a.getAttribute('href') || '';
-          const texto = (a.textContent || '').trim().replace(/\s+/g, ' ');
-          const etiqueta = texto && texto !== url && !/^https?:\/\//i.test(texto) ? texto.slice(0, 120) : '';
-          return { url, etiqueta };
-        })
-        .filter(e => /^https?:\/\//i.test(e.url));
+      return Array.from(doc.querySelectorAll('a[href]')).map(a => {
+        const url = a.getAttribute('href') || '';
+        const texto = (a.textContent || '').trim().replace(/\s+/g, ' ');
+        const etiqueta = texto && texto !== url && !/^https?:\/\//i.test(texto) ? texto.slice(0, 120) : '';
+        return { url, etiqueta };
+      }).filter(e => /^https?:\/\//i.test(e.url));
     } catch (e) { return []; }
   }
 
@@ -252,28 +300,9 @@
     return bytes;
   }
 
-  // Convierte GIF/BMP/WEBP a PNG y endereza fotos JPG con orientación EXIF
-  async function convertirImagen(bytes, origen, destino) {
-    const mime = { jpg: 'image/jpeg', gif: 'image/gif', bmp: 'image/bmp', webp: 'image/webp', png: 'image/png' }[origen];
-    const bmp = await createImageBitmap(new Blob([bytes], { type: mime }), { imageOrientation: 'from-image' });
-    const lienzo = document.createElement('canvas');
-    lienzo.width = bmp.width; lienzo.height = bmp.height;
-    const ctx = lienzo.getContext('2d');
-    ctx.fillStyle = '#ffffff';
-    ctx.fillRect(0, 0, lienzo.width, lienzo.height);
-    ctx.drawImage(bmp, 0, 0);
-    const tipo = destino === 'jpg' ? 'image/jpeg' : 'image/png';
-    const salida = await new Promise(ok => lienzo.toBlob(ok, tipo, 0.92));
-    return new Uint8Array(await salida.arrayBuffer());
-  }
-
   // ------------------------------------------------------------------ interfaz
 
-  function progreso(msg) {
-    const p = $('progreso');
-    p.textContent = msg;
-    p.classList.remove('oculto');
-  }
+  function progreso(msg) { const p = $('progreso'); p.textContent = msg; p.classList.remove('oculto'); }
 
   function limpiarResultado() {
     if (urlPdf) { URL.revokeObjectURL(urlPdf); urlPdf = null; }
@@ -281,9 +310,5 @@
     $('error').classList.add('oculto');
   }
 
-  function mostrarError(msg) {
-    const e = $('error');
-    e.textContent = msg;
-    e.classList.remove('oculto');
-  }
+  function mostrarError(msg) { const e = $('error'); e.textContent = msg; e.classList.remove('oculto'); }
 })();
