@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Correo a PDF</title>
+  <!-- Office.js debe cargarse desde el CDN de Microsoft -->
+  <script src="https://appsforoffice.microsoft.com/lib/1/hosted/office.js"></script>
+  <!-- Librerías locales: ningún dato sale del equipo -->
+  <script src="lib/pdf-lib.min.js"></script>
+  <script src="core.js"></script>
+  <link rel="stylesheet" href="taskpane.css">
+</head>
+<body>
+  <header>
+    <div class="marca">Rama Judicial · Prototipo</div>
+    <h1>Correo a PDF</h1>
+  </header>
+
+  <main>
+    <section id="sin-correo" class="tarjeta oculto">
+      <p>Abra o seleccione un correo para comenzar.</p>
+    </section>
+
+    <section id="correo" class="tarjeta oculto">
+      <div class="etiqueta">Correo seleccionado</div>
+      <div id="asunto" class="asunto"></div>
+      <div id="remitente" class="suave"></div>
+    </section>
+
+    <section id="anexos-caja" class="tarjeta oculto">
+      <div class="etiqueta">Archivos adjuntos <span id="conteo"></span></div>
+      <ul id="lista-anexos"></ul>
+      <div id="alerta-previa" class="alerta oculto"></div>
+    </section>
+
+    <section class="tarjeta">
+      <label class="opcion"><input type="checkbox" id="incluir-en-linea"> Incluir imágenes incrustadas en el cuerpo (firmas, logos)</label>
+      <button id="generar" class="primario" disabled>Generar PDF</button>
+      <div id="progreso" class="suave oculto"></div>
+    </section>
+
+    <section id="resultado" class="tarjeta oculto">
+      <div class="etiqueta">Resultado</div>
+      <div id="resumen"></div>
+      <div id="alertas-finales"></div>
+      <a id="descargar" class="boton primario" download>Descargar PDF</a>
+      <button id="abrir" class="secundario">Abrir en pestaña nueva</button>
+      <details>
+        <summary>Huella del PDF generado (SHA-256)</summary>
+        <code id="huella"></code>
+      </details>
+    </section>
+
+    <section id="error" class="tarjeta alerta oculto"></section>
+  </main>
+
+  <footer>
+    <span id="version"></span> · Todo se procesa en este equipo; el correo no se envía a ningún servidor.
+  </footer>
+
+  <script src="taskpane.js"></script>
+</body>
+</html>
