@@ -1,4 +1,4 @@
-/* Correo a PDF — panel del complemento de Outlook (prototipo v0.2.1) */
+/* Correo a PDF — panel del complemento de Outlook (prototipo v0.3.0) */
 (function () {
   'use strict';
 
@@ -180,8 +180,10 @@
 
       progreso('Maquetando el correo…');
       const comunes = { anchoPx: CorreoPDF.ANCHO_PX, cargarFuente, alProgresar: progreso };
-      const segEncabezado = await CorreoRender.renderizar(CorreoPDF.htmlEncabezado(meta, 'America/Bogota'), Object.assign({ candidatos: [] }, comunes));
       const segCuerpo = await CorreoRender.renderizar(correo.html || correo.texto, Object.assign({ candidatos, esTexto: !correo.html }, comunes));
+      // El encabezado se arma después del cuerpo: así la línea de adjuntos excluye las imágenes que van dentro del cuerpo
+      const adjuntosVisibles = listaAdjuntos(item, correo.partes, segCuerpo.usadas);
+      const segEncabezado = await CorreoRender.renderizar(CorreoPDF.htmlEncabezado(meta, 'America/Bogota', adjuntosVisibles), Object.assign({ candidatos: [] }, comunes));
 
       const anexos = correo.partes.map((p, i) => ({
         nombre: p.nombre, tamano: p.bytes ? p.bytes.length : null, tipo: p.esCorreo ? 'item' : 'archivo',
@@ -201,7 +203,7 @@
         cuerpoTexto: correo.texto,
         externas: segCuerpo.externas,
         origen: correo.diag.origen
-      }, { nombreDespacho: nombreBuzon(), alProgresar: progreso });
+      }, { nombreDespacho: nombreBuzon(), nombreCuenta: nombreCuenta(), enlaceCorreo: enlaceCorreo(item), alProgresar: progreso });
 
       ultimoDiagnostico = {
         version: CorreoPDF.VERSION, fecha: new Date().toISOString(), etapas: ultimoDiagnostico.etapas,
@@ -287,6 +289,35 @@
     if (!p) return '—';
     if (p.displayName && p.emailAddress && p.displayName !== p.emailAddress) return `${p.displayName} <${p.emailAddress}>`;
     return p.emailAddress || p.displayName || '—';
+  }
+
+  /** Adjuntos tal como los lista Outlook (nombre y tamaño reales), sin las imágenes mostradas dentro del cuerpo. */
+  function listaAdjuntos(item, partes, usadas) {
+    const lista = (item.attachments || []).map(a => ({ nombre: a.name, tamano: a.size || 0, enLinea: !!a.isInline, tipo: a.attachmentType }));
+    partes.forEach((p, i) => {
+      if (!usadas.has('p' + i)) return;
+      // quitar una aparición con el mismo nombre (preferir la marcada como incrustada)
+      let k = lista.findIndex(a => a.nombre === p.nombre && a.enLinea);
+      if (k < 0) k = lista.findIndex(a => a.nombre === p.nombre && a.tipo !== 'item' && a.tipo !== 'cloud');
+      if (k >= 0) lista.splice(k, 1);
+    });
+    return lista;
+  }
+
+  function nombreCuenta() {
+    try { return Office.context.mailbox.userProfile.displayName || ''; } catch (e) { return ''; }
+  }
+
+  /** Enlace permanente al mensaje en Outlook web, con el identificador real del correo. */
+  function enlaceCorreo(item) {
+    if (!item.itemId) return '';
+    let origen = 'https://outlook.office365.com';
+    try {
+      const ref = document.referrer ? new URL(document.referrer) : null;
+      if (ref && /(^|\.)outlook\.(office|office365|live|cloud)\.(com|microsoft)$/i.test(ref.hostname)) origen = ref.origin;
+      else if (Office.context.mailbox.restUrl) origen = new URL(Office.context.mailbox.restUrl).origin;
+    } catch (e) { /* usar el valor por defecto */ }
+    return `${origen}/owa/?ItemID=${encodeURIComponent(item.itemId)}&exvsurl=1&viewmodel=ReadMessageItem`;
   }
 
   function nombreBuzon() {

@@ -1,5 +1,5 @@
 /*!
- * Correo a PDF — motor de renderizado HTML → elementos vectoriales (v0.2.0)
+ * Correo a PDF — motor de renderizado HTML → elementos vectoriales (v0.3.0)
  *
  * El navegador maqueta el correo en un marco aislado (sin scripts ni recursos
  * externos) usando fuentes libres con las mismas medidas que las de Microsoft.
@@ -522,7 +522,13 @@ img{max-width:100%!important}
               else if (lado === 'Left') ancho = w; else { x = r.right - w; ancho = w; }
               const cr = { left: x, top: y, right: x + ancho, bottom: y + alto };
               if (fuera(clip, cr)) return;
-              items.push({ t: 'rect', x, y, w: ancho, h: alto, color: c.rgb, guiones: estilo === 'dashed' ? 3 : estilo === 'dotted' ? 1 : 0, sup: y, inf: y + alto });
+              // Bordes en relieve (inset/outset/groove/ridge, p. ej. los <hr>): el navegador los dibuja más claros
+              let rgbBorde = c.rgb;
+              if (/^(inset|outset|groove|ridge)$/.test(estilo)) {
+                const f = (estilo === 'inset' || estilo === 'groove') ? ((lado === 'Top' || lado === 'Left') ? 0.45 : 0.8) : ((lado === 'Top' || lado === 'Left') ? 0.8 : 0.45);
+                rgbBorde = c.rgb.map(v => v + (1 - v) * f);
+              }
+              items.push({ t: 'rect', x, y, w: ancho, h: alto, color: rgbBorde, guiones: estilo === 'dashed' ? 3 : estilo === 'dotted' ? 1 : 0, sup: y, inf: y + alto });
             });
           }
         }

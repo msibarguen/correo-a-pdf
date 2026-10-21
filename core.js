@@ -1,6 +1,6 @@
 /*!
  * Correo a PDF — motor de armado (core)
- * Prototipo v0.2.0 — Unidad de Transformación Digital, Rama Judicial
+ * Prototipo v0.3.0 — Unidad de Transformación Digital, Rama Judicial
  *
  * Arma un único PDF (tamaño oficio) con:
  *   1. El correo tal como se ve: encabezado tipo Outlook y cuerpo HTML redibujado
@@ -28,7 +28,7 @@
 
   const Fuentes = (typeof CorreoFuentes !== 'undefined') ? CorreoFuentes : require('./fuentes.js');
 
-  const VERSION = '0.2.1';
+  const VERSION = '0.3.0';
   const LIMITE_BYTES = 100 * 1024 * 1024; // 100 MB por correo
   const PAGINA = [612, 936]; // oficio colombiano: 21,6 x 33 cm
   const MARGEN = 50;
@@ -529,7 +529,25 @@
     return `${dia.charAt(0).toUpperCase()}${dia.slice(1)} ${p.day}/${p.month}/${p.year} ${p.hour === '24' ? '00' : p.hour}:${p.minute}`;
   }
 
-  function htmlEncabezado(meta, zona) {
+  const ICONO_CLIP = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAADE0lEQVR42u2XTYscVRSG31O37p2eqvGjDQr9AwTtH6DgRogRIYEgSiHOpqph6N3gwqWasmUI4g8QUjDUNLMsFJIouEwLLl0JvRyGQWlQWwxY33XvcWGPNEoy6S835l3WF89565xTbwGLizzPEwAI/zfRedVBEFz2ff/pueNLy17Adqvb7dLZ2dltAFeUUs+toyrrUS7yPM9KkkSfnp5+0Wq1rhpjkKYp/ycAnueJJEl0r9d7VSl1vaoqQ0TfTKfTMgxDCwBv3IH9/f0tY8yAiFhr/atS6t08z/V4PLZnECs11kXn2fO8p1zX/anVarl5nt8cDocfzlfe7/dlp9Ph8XjM3W6XJpMJdTodPRgMzFqaUCnFzJxbluUCyACw7/sfuK5rp2n6VRRF3296Cv71umzbPhBCAMDbvV7vSymllef5d0T0/M7OzqU8z+/FcTwKw9B6mBP2suRN09zPssyxLKtm5tBxHJRleQvAW47jPJtl2WcARpPJRAAwKzXhg+5VSkkAd5n5h6qqaiK6D+DnPM9rZv5jbVPwIDEzmPlJAC0AEoCYuSqJyNo4wEyGiHije2CTegzwGGAtU7DKF3EVgIaZebYDBDMbZl44HdnLQksp23Vdg5l7RGTNFo9ZNKIt4gABABHlzExa6wNm1o7j7Liu62RZdkcI8QmA9l/GYH2bcGtriwE0Wmsw82Ui4jiOP9JaXzXGDLIsuxHH8ZtE9KKU8gmtNQAU6wgk6Pf7MoqiJgiCG0qpsGkaMsZcPzo6uvvPYoIg+FYp9UpZllNjzAvHx8fT81CzNMD5A3Z3d9tSyh+llE7TNAWAT5VSUV3XjTHmJaXUe03TvLa9vW2laToYDocfz+DrlRyYD6a+71+zbfu2mCWRqqp+B6ABPKOUIiEEiqL4uq7rd8qyLJIkuXBEH7ljz5NNEASvSynfN8ZcUUoJADDGoCiKXyzL+vzk5ORgNBo1F1m/MMC8EwCwt7f3hhDi5aqqwMy1EOLW4eHhb/OvbSOr82ExPAxDe9Gilv6v8zxPtNvtv2GiKGo2VvUm9SddQGucT33L4QAAAABJRU5ErkJggg==';
+
+  function tamanoOutlook(bytes) {
+    if (!(bytes > 0)) return '0 KB';
+    if (bytes < 1024 * 1024) return Math.max(1, Math.round(bytes / 1024)) + ' KB';
+    return (bytes / (1024 * 1024)).toFixed(1).replace('.', ',') + ' MB';
+  }
+
+  /** Línea de adjuntos como la muestra Outlook: "2 archivos adjuntos (222 KB)" y los nombres. */
+  function htmlAdjuntos(adjuntos) {
+    if (!adjuntos || !adjuntos.length) return '';
+    const total = adjuntos.reduce((s, a) => s + (a.tamano || 0), 0);
+    const titulo = adjuntos.length === 1 ? '1 archivo adjunto' : `${adjuntos.length} archivos adjuntos`;
+    return `<div style="margin-top:14px;font-size:11px;color:#424242">
+<div style="margin-bottom:3px"><img src="${ICONO_CLIP}" width="10" height="10" style="width:10px;height:10px;vertical-align:-1px;margin-right:5px">${titulo} (${tamanoOutlook(total)})</div>
+<div>${adjuntos.map(a => esc(a.nombre) + ';').join(' ')}</div></div>`;
+  }
+
+  function htmlEncabezado(meta, zona, adjuntos) {
     const m = meta || {};
     const fila = (etq, val) => val ? `<tr><td style="font-weight:700;padding:2px 12px 2px 2px;vertical-align:top;white-space:nowrap">${etq}</td>` +
       `<td style="padding:2px 0;vertical-align:top">${esc(val)}</td></tr>` : '';
@@ -537,7 +555,7 @@
 <div style="border-top:1px solid #c8c8c8;border-bottom:1px solid #c8c8c8;padding:9px 0 9px 2px;margin-bottom:12px;font-size:15px;font-weight:700;line-height:1.35">${esc(m.asunto || '(sin asunto)')}</div>
 <table style="border-collapse:collapse;font-size:12px;line-height:1.4">
 ${fila('Desde', m.de)}${fila('Fecha', m.recibido ? fechaOutlook(m.recibido, zona || ZONA_HORARIA) : '')}${fila('Para', (m.para || []).join('; '))}${fila('CC', (m.cc || []).join('; '))}
-</table><div style="height:16px"></div></div>`;
+</table>${htmlAdjuntos(adjuntos)}<div style="height:18px"></div></div>`;
   }
 
   // ---------------------------------------------------------------------------
@@ -833,18 +851,43 @@ ${fila('Desde', m.de)}${fila('Fecha', m.recibido ? fechaOutlook(m.recibido, zona
     copiadas.forEach(p => doc.addPage(p));
     marcadores.push({ titulo: 'Hoja de control', indicePagina: inicioHoja - 1 });
 
-    // Pie de página en las páginas propias (correo y hoja de control)
+    // Encabezado y pie en las páginas propias (correo y hoja de control); los anexos no se tocan
     const total = doc.getPageCount();
     const helv = await doc.embedFont(StandardFonts.Helvetica);
-    const pie = (i) => {
-      const p = doc.getPage(i);
-      const { width } = p.getSize();
-      const t = `Página ${i + 1} de ${total}`;
-      p.drawText(t, { x: width - M.der - helv.widthOfTextAtSize(t, 7.5), y: 22, size: 7.5, font: helv, color: COLOR.suave });
-      p.drawText(`Correo a PDF v${VERSION} (prototipo)`, { x: M.izq, y: 22, size: 7, font: helv, color: COLOR.suave });
+    const gris = rgb(0.25, 0.25, 0.27), grisSuave = COLOR.suave;
+    const ahora = opciones.ahora || new Date();
+    const pf = partesFecha(ahora, opciones.zonaHoraria);
+    const fechaImpresion = `${pf.day}/${pf.month}/${pf.year.slice(-2)}, ${pf.hour === '24' ? '00' : pf.hour}:${pf.minute}`;
+    const tituloCuenta = opciones.nombreCuenta ? `Correo: ${opciones.nombreCuenta} - Outlook` : '';
+    const enlace = opciones.enlaceCorreo || '';
+    const recortar = (txt, tam, ancho) => {
+      if (helv.widthOfTextAtSize(txt, tam) <= ancho) return txt;
+      let s = txt;
+      while (s.length > 1 && helv.widthOfTextAtSize(s + '...', tam) > ancho) s = s.slice(0, -1);
+      return s + '...';
     };
-    for (let i = 0; i < paginasCorreo; i++) pie(i);
-    for (let i = inicioHoja - 1; i < total; i++) pie(i);
+    const marcarPagina = (i) => {
+      const p = doc.getPage(i);
+      const { width, height } = p.getSize();
+      // Encabezado: fecha y hora de generación · cuenta de Outlook
+      p.drawText(fechaImpresion, { x: M.izq - 18, y: height - 20, size: 7.5, font: helv, color: gris });
+      if (tituloCuenta) {
+        const t = recortar(tituloCuenta, 7.5, width - 2 * M.izq - 120);
+        p.drawText(t, { x: (width - helv.widthOfTextAtSize(t, 7.5)) / 2, y: height - 20, size: 7.5, font: helv, color: gris });
+      }
+      // Pie: enlace al mensaje · número de página
+      const num = `Página ${i + 1} de ${total}`;
+      const anchoNum = helv.widthOfTextAtSize(num, 7.5);
+      p.drawText(num, { x: width - M.der + 18 - anchoNum, y: 26, size: 7.5, font: helv, color: gris });
+      if (enlace) {
+        const t = recortar(enlace, 6.5, width - M.izq - M.der + 36 - anchoNum - 16);
+        p.drawText(t, { x: M.izq - 18, y: 26, size: 6.5, font: helv, color: gris });
+        agregarEnlace(doc, { pagina: p, x: M.izq - 18, y: 24, w: helv.widthOfTextAtSize(t, 6.5), h: 9 }, enlace);
+      }
+      p.drawText(`Generado con Correo a PDF v${VERSION} · Rama Judicial (prototipo)`, { x: M.izq - 18, y: 15, size: 6.5, font: helv, color: grisSuave });
+    };
+    for (let i = 0; i < paginasCorreo; i++) marcarPagina(i);
+    for (let i = inicioHoja - 1; i < total; i++) marcarPagina(i);
 
     gestor.finalizar();
     agregarMarcadores(doc, marcadores);
@@ -875,7 +918,7 @@ ${fila('Desde', m.de)}${fila('Fecha', m.recibido ? fechaOutlook(m.recibido, zona
 
   return {
     VERSION, LIMITE_BYTES, PAGINA, ANCHO_PX,
-    generarPdf, htmlEncabezado, fechaOutlook, prediccionPorNombre, detectarTipo, detectarRadicados, formatoRadicado,
+    generarPdf, htmlEncabezado, htmlAdjuntos, tamanoOutlook, fechaOutlook, prediccionPorNombre, detectarTipo, detectarRadicados, formatoRadicado,
     normalizarEnlaces, enlacesDeTexto, tamanoLegible, orientacionExif, calcularCortes
   };
 });
